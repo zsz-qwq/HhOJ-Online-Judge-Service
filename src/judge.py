@@ -1,16 +1,33 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
+"""
+HhOJ 评测机主程序（优化版）
+============================================================
+关键优化：
+  1. 批量拉取：一次 fetch 最多 N 条 pending，减少 RTT
+  2. 并行评测：用线程池并行评测多条提交（IO 密集 + CPU 子进程并行）
+  3. 测试点缓存：同题目测试点文件用 ETag 缓存，重复评测时 304 直接跳过下载
+  4. 内联测试点：fetch 时带 inline_testcases=1，小测试点直接嵌入响应，零下载
+  5. 连接复用：urllib opener 复用 TCP/TLS 连接
+  6. 智能退避：队列空时指数退避，最长 60s，避免空轮询消耗 Actions 配额
+  7. 提前终止：编译失败直接跳过所有测试点，节省时间
+  8. 题目级复用：同题代码二进制无需重复编译（不同提交不同代码时不复用，仅同题测试点复用）
+  9. 超时取消：单条提交超过 hard_timeout 直接放弃并回写 RE，避免卡死整个工作流
+"""
 import argparse
 import base64
 import hashlib
+import http.cookiejar
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
@@ -24,49 +41,230 @@ from runners.java_runner import JavaRunner
 from runners.python_runner import Python3Runner
 from runners.pascal_runner import PascalRunner
 
+# ============================================================
+# AES 后端：优先 pycryptodome，回退 cryptography
+# 用于求解 InfinityFree 反爬虫 AES-CBC 挑战
+# ============================================================
+_AES_BACKEND = None
+try:
+    from Crypto.Cipher import AES as _PycryptoAES
+    _AES_BACKEND = 'pycryptodome'
+except ImportError:
+    try:
+        from cryptography.hazmat.primitives.ciphers import Cipher as _CryptoCipher
+        from cryptography.hazmat.primitives.ciphers import algorithms as _CryptoAlgorithms
+        from cryptography.hazmat.primitives.ciphers import modes as _CryptoModes
+        _AES_BACKEND = 'cryptography'
+    except ImportError:
+        _AES_BACKEND = None
+
+
+def _aes_cbc_decrypt_raw(key: bytes, iv: bytes, ciphertext: bytes) -> bytes:
+    """AES-CBC 解密，返回原始字节（含 PKCS7 padding，与 JS slowAES 行为一致）。"""
+    if _AES_BACKEND == 'pycryptodome':
+        return _PycryptoAES.new(key, _PycryptoAES.MODE_CBC, iv).decrypt(ciphertext)
+    if _AES_BACKEND == 'cryptography':
+        decryptor = _CryptoCipher(_CryptoAlgorithms.AES(key), _CryptoModes.CBC(iv)).decryptor()
+        return decryptor.update(ciphertext) + decryptor.finalize()
+    raise RuntimeError('无可用 AES 后端，请安装 pycryptodome 或 cryptography')
+
 
 # ============================================================
-# 网站接口客户端（带连接复用 + ETag 缓存）
+# 网站接口客户端（带连接复用 + ETag 缓存 + InfinityFree 反爬绕过）
 # ============================================================
 class SiteClient:
     def __init__(self, site_url: str, api_key: str, timeout: int = 30):
         self.site_url = site_url.rstrip('/')
         self.api_key = api_key
         self.timeout = timeout
-        # 复用 opener：保持 TCP/TLS 连接，减少握手开销
-        self.opener = urllib.request.build_opener()
+        # CookieJar：持久化 InfinityFree __test 反爬 cookie
+        self.cookie_jar = http.cookiejar.CookieJar()
+        self.opener = urllib.request.build_opener(
+            urllib.request.HTTPCookieProcessor(self.cookie_jar)
+        )
         # ETag 缓存：file_path -> (etag, local_path)
         # 同题目的测试点 mtime 不变时，第二次起返回 304
         self._etag_cache = {}
         self._etag_lock = threading.Lock()
+        self._challenge_solved = False  # 是否已解决过 InfinityFree 挑战
 
+    # ------------------------------------------------------------
+    # InfinityFree 反爬挑战检测与求解
+    # ------------------------------------------------------------
+    def _is_challenge_page(self, body: bytes) -> bool:
+        """检测响应体是否为 InfinityFree 反爬挑战页（含 /aes.js + toNumbers）。"""
+        if not body or len(body) > 8192:
+            return False  # 挑战页很小，大响应直接跳过
+        try:
+            text = body.decode('utf-8', errors='replace')
+        except Exception:
+            return False
+        return '/aes.js' in text or 'toNumbers(' in text
+
+    def _solve_infinityfree_challenge(self, body: bytes):
+        """
+        解析 InfinityFree 反爬挑战页，返回 __test cookie 值（hex 字符串）。
+        挑战页结构（标准 InfinityFree 格式）：
+          var a=toNumbers("HEX_IV"), b=toNumbers("HEX_KEY"), c=toNumbers("HEX_CT");
+          document.cookie="__test="+toHex(slowAES.decrypt(c,2,b,a))+...;
+        其中 slowAES.decrypt(ciphertext, mode=2=CBC, key, IV)。
+        """
+        if _AES_BACKEND is None:
+            print('[infinityfree] 无 AES 后端，无法求解挑战（请安装 pycryptodome 或 cryptography）', flush=True)
+            return None
+        try:
+            html = body.decode('utf-8', errors='replace')
+        except Exception:
+            return None
+        hexes = re.findall(r'toNumbers\("([0-9a-fA-F]+)"\)', html)
+        if len(hexes) < 3:
+            print(f'[infinityfree] 挑战页未找到 3 个 hex 值（实际 {len(hexes)} 个）', flush=True)
+            return None
+
+        # 标准顺序：a=IV, b=key, c=ciphertext
+        # 但保险起见，尝试调用表达式解析；失败则遍历 6 种排列，命中 PKCS7 合法 padding 即采用
+        candidates = []
+        # 优先按标准顺序
+        candidates.append((bytes.fromhex(hexes[0]), bytes.fromhex(hexes[1]), bytes.fromhex(hexes[2])))
+        # 补齐其余 5 种排列
+        import itertools
+        for perm in itertools.permutations(hexes, 3):
+            trip = (bytes.fromhex(perm[0]), bytes.fromhex(perm[1]), bytes.fromhex(perm[2]))
+            if trip not in candidates:
+                candidates.append(trip)
+
+        for iv, key, ct in candidates:
+            if len(key) not in (16, 24, 32) or len(iv) != 16 or len(ct) % 16 != 0:
+                continue
+            try:
+                decrypted = _aes_cbc_decrypt_raw(key, iv, ct)
+            except Exception:
+                continue
+            # 验证 PKCS7 padding 合法性（padding 值 1-16，末尾 pad 字节全等于 pad）
+            if not decrypted:
+                continue
+            pad = decrypted[-1]
+            if 1 <= pad <= 16 and decrypted[-pad:] == bytes([pad]) * pad:
+                return decrypted.hex()
+
+        print('[infinityfree] 所有 AES 排列均无法产生合法 PKCS7 padding', flush=True)
+        return None
+
+    def _set_test_cookie(self, value: str):
+        """将求解出的 __test cookie 注入 CookieJar（host-only，1 小时有效）。"""
+        parsed = urllib.parse.urlparse(self.site_url)
+        domain = parsed.hostname or ''
+        if domain.startswith('.'):
+            domain = domain[1:]
+        cookie = http.cookiejar.Cookie(
+            version=0, name='__test', value=value,
+            port=None, port_specified=False,
+            domain=domain, domain_specified=False, domain_initial_dot=False,
+            path='/', path_specified=True,
+            secure=(parsed.scheme == 'https'), expires=int(time.time()) + 3600,
+            discard=False, comment=None, comment_url=None, rest={}, rfc2109=False,
+        )
+        self.cookie_jar.set_cookie(cookie)
+
+    def warmup(self):
+        """启动时发起一次预热请求，主动触发并解决 InfinityFree 反爬挑战。"""
+        try:
+            req = urllib.request.Request(
+                self.site_url + '/api/judge_fetch.php?batch=1',
+                method='GET',
+                headers={'X-API-Key': self.api_key, 'User-Agent': 'HhOJ-Judge/2.0'},
+            )
+            resp = self.opener.open(req, timeout=self.timeout)
+            body = resp.read()
+            if self._is_challenge_page(body):
+                cookie_val = self._solve_infinityfree_challenge(body)
+                if cookie_val:
+                    self._set_test_cookie(cookie_val)
+                    self._challenge_solved = True
+                    print('[infinityfree] 预热阶段已解决 AES 反爬挑战', flush=True)
+                    return True
+                print('[infinityfree] 预热阶段未能解决挑战', flush=True)
+                return False
+            # 未遇到挑战（可能是非 InfinityFree 主机或 cookie 已生效）
+            self._challenge_solved = True
+            return True
+        except Exception as e:
+            print(f'[warmup] 预热请求异常: {e}', flush=True)
+            return False
+
+    # ------------------------------------------------------------
+    # HTTP 请求（含挑战自动检测 + 重试）
+    # ------------------------------------------------------------
     def _request(self, method: str, path: str, *, json_body=None, stream_to=None, headers_extra=None):
         url = self.site_url + path
-        headers = {'X-API-Key': self.api_key, 'User-Agent': 'HhOJ-Judge/2.0', 'Host': 'hhoj.xo.je'}
+        headers = {'X-API-Key': self.api_key, 'User-Agent': 'HhOJ-Judge/2.0'}
         if headers_extra:
             headers.update(headers_extra)
         data = None
         if json_body is not None:
             headers['Content-Type'] = 'application/json'
             data = json.dumps(json_body).encode('utf-8')
-        req = urllib.request.Request(url, method=method, headers=headers, data=data)
-        try:
-            resp = self.opener.open(req, timeout=self.timeout)
-            if stream_to is not None:
-                with open(stream_to, 'wb') as f:
-                    while True:
-                        chunk = resp.read(64 * 1024)
-                        if not chunk:
-                            break
-                        f.write(chunk)
-                # 返回响应头供调用方使用（ETag）
-                return resp.status, b'', dict(resp.headers)
-            return resp.status, resp.read(), dict(resp.headers)
-        except urllib.error.HTTPError as e:
-            body = e.read() if e.fp else b''
-            return e.code, body, dict(e.headers) if e.headers else {}
-        except (urllib.error.URLError, TimeoutError, ConnectionError) as e:
-            return 0, str(e).encode('utf-8'), {}
+
+        # 最多重试 2 次：第 1 次可能拿到 InfinityFree 挑战页，解决后第 2 次拿真实数据
+        for attempt in range(2):
+            req = urllib.request.Request(url, method=method, headers=headers, data=data)
+            try:
+                resp = self.opener.open(req, timeout=self.timeout)
+                status = resp.status
+                resp_headers = dict(resp.headers)
+
+                if stream_to is not None:
+                    # 流式下载：先读 1KB 探测是否为挑战页
+                    peek = resp.read(1024)
+                    if self._is_challenge_page(peek):
+                        rest = resp.read()
+                        body = peek + rest
+                        if attempt == 0:
+                            cookie_val = self._solve_infinityfree_challenge(body)
+                            if cookie_val:
+                                self._set_test_cookie(cookie_val)
+                                self._challenge_solved = True
+                                print('[infinityfree] AES 反爬挑战已解决，重试下载请求', flush=True)
+                                continue
+                        return status, body, resp_headers
+                    # 正常响应：peek + 剩余流式写入文件
+                    with open(stream_to, 'wb') as f:
+                        f.write(peek)
+                        while True:
+                            chunk = resp.read(64 * 1024)
+                            if not chunk:
+                                break
+                            f.write(chunk)
+                    return status, b'', resp_headers
+
+                # 普通请求：读完整 body
+                body = resp.read()
+                if self._is_challenge_page(body) and attempt == 0:
+                    cookie_val = self._solve_infinityfree_challenge(body)
+                    if cookie_val:
+                        self._set_test_cookie(cookie_val)
+                        self._challenge_solved = True
+                        print('[infinityfree] AES 反爬挑战已解决，重试请求', flush=True)
+                        continue
+                return status, body, resp_headers
+
+            except urllib.error.HTTPError as e:
+                body = e.read() if e.fp else b''
+                resp_headers = dict(e.headers) if e.headers else {}
+                # 挑战页也可能以 403/503 返回
+                if self._is_challenge_page(body) and attempt == 0:
+                    cookie_val = self._solve_infinityfree_challenge(body)
+                    if cookie_val:
+                        self._set_test_cookie(cookie_val)
+                        self._challenge_solved = True
+                        print('[infinityfree] AES 反爬挑战已解决，重试请求', flush=True)
+                        continue
+                return e.code, body, resp_headers
+            except (urllib.error.URLError, TimeoutError, ConnectionError) as e:
+                return 0, str(e).encode('utf-8'), {}
+
+        # 重试耗尽（挑战未能解决）
+        return 0, b'infinityfree_challenge_unsolved', {}
 
     def fetch_submissions(self, batch: int = 5, inline_testcases: bool = True):
         """
@@ -464,6 +662,15 @@ def main():
     print(f'网站: {args.site_url}', flush=True)
     print(f'批量: {args.batch_size}  并行: {args.workers}  tc并行: {args.tc_workers}', flush=True)
     print(f'退避: {args.idle_wait_min}-{args.idle_wait_max}s  空轮上限: {args.max_idle}', flush=True)
+    if _AES_BACKEND:
+        print(f'AES 后端: {_AES_BACKEND}（InfinityFree 反爬绕过已就绪）', flush=True)
+    else:
+        print('警告: 未检测到 AES 后端，InfinityFree 反爬挑战将无法自动绕过', flush=True)
+        print('      请在 workflow 中添加: pip install pycryptodome', flush=True)
+    print(flush=True)
+
+    # 预热：主动触发并解决 InfinityFree 反爬挑战（若存在）
+    client.warmup()
     print(flush=True)
 
     while True:
