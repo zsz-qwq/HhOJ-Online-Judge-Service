@@ -42,7 +42,7 @@ class SiteClient:
 
     def _request(self, method: str, path: str, *, json_body=None, stream_to=None, headers_extra=None):
         url = self.site_url + path
-        headers = {'X-API-Key': self.api_key, 'User-Agent': 'HhOJ-Judge/2.0'}
+        headers = {'X-API-Key': self.api_key, 'User-Agent': 'HhOJ-Judge/2.0', 'Host': 'hhoj.xo.je'}
         if headers_extra:
             headers.update(headers_extra)
         data = None
