@@ -13,7 +13,8 @@ module.exports = {
 
   // Server configuration
   server: {
-    port: process.env.PORT || 3000
+    port: process.env.PORT || 3000,
+    apiKey: process.env.HHOJ_API_KEY || ''
   },
 
   // Judge configuration
