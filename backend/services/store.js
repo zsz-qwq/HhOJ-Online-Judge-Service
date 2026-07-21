@@ -64,6 +64,27 @@ class StoreService {
   }
 
   /**
+   * List pending judge requests (for GitHub Actions to fetch)
+   * @param {number} limit - Maximum number of submissions to return
+   * @returns {Array} - Pending judge requests with full data
+   */
+  listPending(limit = 10) {
+    const pending = [];
+    for (const [id, data] of judgeStore.entries()) {
+      if (data.status === 'pending' || data.status === 'queued') {
+        pending.push({
+          judgeId: id,
+          ...data
+        });
+        if (pending.length >= limit) {
+          break;
+        }
+      }
+    }
+    return pending;
+  }
+
+  /**
    * Clean up old entries (older than maxAge ms)
    * @param {number} maxAge - Maximum age in milliseconds
    */

@@ -4,6 +4,7 @@ const bodyParser = require('body-parser');
 
 const judgeRoutes = require('./routes/judge');
 const resultRoutes = require('./routes/result');
+const githubActionsRoutes = require('./routes/githubActions');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -16,6 +17,7 @@ app.use(bodyParser.urlencoded({ extended: true, limit: '50mb' }));
 // Routes
 app.use('/api', judgeRoutes);
 app.use('/api', resultRoutes);
+app.use('/api', githubActionsRoutes);
 
 // Health check
 app.get('/health', (req, res) => {
