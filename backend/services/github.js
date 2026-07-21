@@ -1,5 +1,8 @@
 const { Octokit } = require('@octokit/rest');
 const config = require('../config');
+const fs = require('fs');
+const path = require('path');
+const AdmZip = require('adm-zip');
 
 class GitHubService {
   constructor() {
@@ -8,16 +11,11 @@ class GitHubService {
     });
   }
 
-  /**
-   * Trigger the judge workflow
-   * @param {Object} payload - The judge payload
-   * @returns {Promise<string>} - The workflow run ID
-   */
   async triggerWorkflow(payload) {
     const { owner, repo, workflowId, ref } = config.github;
 
     try {
-      const response = await this.octokit.actions.createWorkflowDispatch({
+      await this.octokit.actions.createWorkflowDispatch({
         owner,
         repo,
         workflow_id: workflowId,
@@ -31,49 +29,24 @@ class GitHubService {
         }
       });
 
-      const runId = await this._pollForRunId(owner, repo, workflowId, payload.judgeId);
-      return runId;
+      const runs = await this.octokit.actions.listWorkflowRuns({
+        owner,
+        repo,
+        workflow_id: workflowId,
+        per_page: 1
+      });
+
+      if (runs.data.workflow_runs.length > 0) {
+        return runs.data.workflow_runs[0].id;
+      }
+
+      return null;
     } catch (error) {
       console.error('Failed to trigger workflow:', error);
       throw error;
     }
   }
 
-  async _pollForRunId(owner, repo, workflowId, judgeId, maxAttempts = 30, delayMs = 1000) {
-    for (let i = 0; i < maxAttempts; i++) {
-      const runs = await this.octokit.actions.listWorkflowRuns({
-        owner,
-        repo,
-        workflow_id: workflowId,
-        per_page: 5
-      });
-
-      for (const run of runs.data.workflow_runs) {
-        if (run.event === 'workflow_dispatch') {
-          try {
-            const jobRuns = await this.octokit.actions.listJobsForWorkflowRun({
-              owner,
-              repo,
-              run_id: run.id
-            });
-            return run.id;
-          } catch {
-            continue;
-          }
-        }
-      }
-
-      await new Promise(resolve => setTimeout(resolve, delayMs));
-    }
-
-    throw new Error('Failed to get run ID after multiple attempts');
-  }
-
-  /**
-   * Get workflow run status
-   * @param {number} runId - The workflow run ID
-   * @returns {Promise<Object>} - The run status and result
-   */
   async getRunStatus(runId) {
     const { owner, repo } = config.github;
 
@@ -88,8 +61,8 @@ class GitHubService {
 
       return {
         id: run.id,
-        status: run.status,      // queued, in_progress, completed
-        conclusion: run.conclusion, // success, failure, cancelled, etc.
+        status: run.status,
+        conclusion: run.conclusion,
         html_url: run.html_url,
         created_at: run.created_at,
         updated_at: run.updated_at
@@ -100,11 +73,6 @@ class GitHubService {
     }
   }
 
-  /**
-   * Download artifact containing judge results
-   * @param {number} runId - The workflow run ID
-   * @returns {Promise<Object>} - The judge result
-   */
   async getResult(runId) {
     const { owner, repo } = config.github;
 
@@ -129,13 +97,6 @@ class GitHubService {
         artifact_id: resultArtifact.id,
         archive_format: 'zip'
       });
-
-      const fs = require('fs');
-      const path = require('path');
-      const zlib = require('zlib');
-      const { Readable } = require('stream');
-      const { finished } = require('stream/promises');
-      const AdmZip = require('adm-zip');
 
       const tempDir = path.join(__dirname, '../temp');
       if (!fs.existsSync(tempDir)) {
@@ -179,11 +140,6 @@ class GitHubService {
     }
   }
 
-  /**
-   * Get workflow run logs
-   * @param {number} runId - The workflow run ID
-   * @returns {Promise<string>} - The logs URL
-   */
   async getLogs(runId) {
     const { owner, repo } = config.github;
 

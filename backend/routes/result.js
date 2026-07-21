@@ -125,9 +125,9 @@ router.post('/callback', requireApiKey, async (req, res) => {
 
 /**
  * GET /api/list
- * List all judge requests
+ * List all judge requests (requires API Key)
  */
-router.get('/list', (req, res) => {
+router.get('/list', requireApiKey, (req, res) => {
   const list = store.list();
   res.json({
     success: true,

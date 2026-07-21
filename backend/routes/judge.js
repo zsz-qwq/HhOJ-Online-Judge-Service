@@ -4,6 +4,7 @@ const { v4: uuidv4 } = require('uuid');
 const githubService = require('../services/github');
 const store = require('../services/store');
 const config = require('../config');
+const requireApiKey = require('../middleware/apiKey');
 
 /**
  * POST /api/judge
@@ -105,9 +106,9 @@ router.post('/judge', async (req, res) => {
 
 /**
  * GET /api/status/:judgeId
- * Get judge status
+ * Get judge status (requires API Key)
  */
-router.get('/status/:judgeId', async (req, res) => {
+router.get('/status/:judgeId', requireApiKey, async (req, res) => {
   try {
     const { judgeId } = req.params;
     const record = store.get(judgeId);
