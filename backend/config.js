@@ -1,5 +1,4 @@
-// GitHub configuration
-// Copy this file to config.local.js and fill in your values
+require('dotenv').config();
 
 module.exports = {
   // GitHub repository configuration

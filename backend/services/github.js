@@ -17,7 +17,6 @@ class GitHubService {
     const { owner, repo, workflowId, ref } = config.github;
 
     try {
-      // Trigger workflow_dispatch
       const response = await this.octokit.actions.createWorkflowDispatch({
         owner,
         repo,
@@ -32,23 +31,42 @@ class GitHubService {
         }
       });
 
-      // Get the workflow run ID by listing recent runs
-      const runs = await this.octokit.actions.listWorkflowRuns({
-        owner,
-        repo,
-        workflow_id: workflowId,
-        per_page: 1
-      });
-
-      if (runs.data.workflow_runs.length > 0) {
-        return runs.data.workflow_runs[0].id;
-      }
-
-      return null;
+      const runId = await this._pollForRunId(owner, repo, workflowId, payload.judgeId);
+      return runId;
     } catch (error) {
       console.error('Failed to trigger workflow:', error);
       throw error;
     }
+  }
+
+  async _pollForRunId(owner, repo, workflowId, judgeId, maxAttempts = 30, delayMs = 1000) {
+    for (let i = 0; i < maxAttempts; i++) {
+      const runs = await this.octokit.actions.listWorkflowRuns({
+        owner,
+        repo,
+        workflow_id: workflowId,
+        per_page: 5
+      });
+
+      for (const run of runs.data.workflow_runs) {
+        if (run.event === 'workflow_dispatch') {
+          try {
+            const jobRuns = await this.octokit.actions.listJobsForWorkflowRun({
+              owner,
+              repo,
+              run_id: run.id
+            });
+            return run.id;
+          } catch {
+            continue;
+          }
+        }
+      }
+
+      await new Promise(resolve => setTimeout(resolve, delayMs));
+    }
+
+    throw new Error('Failed to get run ID after multiple attempts');
   }
 
   /**
@@ -91,7 +109,6 @@ class GitHubService {
     const { owner, repo } = config.github;
 
     try {
-      // List artifacts for the workflow run
       const artifacts = await this.octokit.actions.listWorkflowRunArtifacts({
         owner,
         repo,
@@ -106,7 +123,6 @@ class GitHubService {
         return null;
       }
 
-      // Download the artifact
       const download = await this.octokit.actions.downloadArtifact({
         owner,
         repo,
@@ -114,12 +130,48 @@ class GitHubService {
         archive_format: 'zip'
       });
 
-      // Parse the result from the artifact
-      // Note: In production, you'd need to unzip and parse the files
-      // For simplicity, we'll return the download URL
+      const fs = require('fs');
+      const path = require('path');
+      const zlib = require('zlib');
+      const { Readable } = require('stream');
+      const { finished } = require('stream/promises');
+      const AdmZip = require('adm-zip');
+
+      const tempDir = path.join(__dirname, '../temp');
+      if (!fs.existsSync(tempDir)) {
+        fs.mkdirSync(tempDir, { recursive: true });
+      }
+
+      const zipPath = path.join(tempDir, `artifact_${runId}.zip`);
+      const zipBuffer = Buffer.isBuffer(download.data) ? download.data : Buffer.from(download.data);
+      fs.writeFileSync(zipPath, zipBuffer);
+
+      let resultData = null;
+      try {
+        const zip = new AdmZip(zipPath);
+        const entries = zip.getEntries();
+
+        for (const entry of entries) {
+          if (entry.entryName === 'judge_result.json') {
+            const content = zip.readAsText(entry);
+            resultData = JSON.parse(content);
+            break;
+          }
+        }
+      } catch (parseError) {
+        console.error('Failed to parse artifact:', parseError);
+      }
+
+      try {
+        fs.unlinkSync(zipPath);
+      } catch {
+        // Ignore cleanup errors
+      }
+
       return {
         artifactId: resultArtifact.id,
-        downloadUrl: download.url
+        downloadUrl: download.url,
+        result: resultData
       };
     } catch (error) {
       console.error('Failed to get result:', error);
