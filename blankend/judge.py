@@ -67,17 +67,17 @@ def solve_infinitree_challenge(html_text):
     b = bytes.fromhex(numbers[1])  # IV
     c = bytes.fromhex(numbers[2])  # ciphertext
 
-    # Try ECB first (most common for InfinityFree)
+    # Try CBC first (most common for InfinityFree)
     try:
-        cipher = AES.new(a, AES.MODE_ECB)
+        cipher = AES.new(a, AES.MODE_CBC, b)
         decrypted = cipher.decrypt(c)
         return decrypted.hex()
     except Exception:
         pass
 
-    # Try CBC as fallback
+    # Try ECB as fallback
     try:
-        cipher = AES.new(a, AES.MODE_CBC, b)
+        cipher = AES.new(a, AES.MODE_ECB)
         decrypted = cipher.decrypt(c)
         return decrypted.hex()
     except Exception:
