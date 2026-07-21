@@ -164,10 +164,10 @@ def prepare_testcase(tc, sub_dir, session, cache_dir):
 
 
 def judge_submission(submission, work_dir, session):
-    sub_id = submission['id']
-    language = submission['language']
-    code = submission['code']
-    testcases = submission['testcases']
+    sub_id = submission.get('id', 'unknown')
+    language = submission.get('language', '')
+    code = submission.get('code', '')
+    testcases = submission.get('testcases') or []
     time_limit = submission.get('time_limit', 1000)
     memory_limit = submission.get('memory_limit', 256)
 
@@ -185,6 +185,11 @@ def judge_submission(submission, work_dir, session):
         'error_message': '',
         'testcases': []
     }
+
+    if not code:
+        result['status'] = RESULT_CE
+        result['error_message'] = 'Empty or missing source code'
+        return result
 
     try:
         runner = get_runner(language)
@@ -353,7 +358,9 @@ def main():
             results.append(result)
             print(f"[{sub_id}] Result: {result['status']} (score: {result['score']}, time: {result['time_used']}ms)")
         except Exception as e:
+            import traceback
             print(f"[{sub_id}] Error: {e}", file=sys.stderr)
+            traceback.print_exc()
             results.append({
                 'submission_id': sub_id,
                 'status': RESULT_UKE,
