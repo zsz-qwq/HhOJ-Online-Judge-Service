@@ -1,5 +1,4 @@
-// GitHub configuration
-// Copy this file to config.local.js and fill in your values
+require('dotenv').config();
 
 module.exports = {
   // GitHub repository configuration
@@ -13,13 +12,25 @@ module.exports = {
 
   // Server configuration
   server: {
-    port: process.env.PORT || 3000
+    port: process.env.PORT || 3000,
+    apiKey: process.env.HHOJ_API_KEY || ''
   },
 
   // Judge configuration
   judge: {
-    defaultTimeLimit: 2000,   // ms
+    defaultTimeLimit: 1000,   // ms
     defaultMemoryLimit: 256,  // MB
-    supportedLanguages: ['cpp', 'c', 'python', 'java', 'go', 'rust', 'javascript', 'csharp']
+    supportedLanguages: [
+      'c',
+      'cpp',
+      'cpp11', 'cpp11_o2',
+      'cpp14', 'cpp14_o2',
+      'cpp17', 'cpp17_o2',
+      'cpp23', 'cpp23_o2',
+      'python', 'python3',
+      'java',
+      'csharp',
+      'pascal'
+    ]
   }
 };

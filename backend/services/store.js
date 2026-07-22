@@ -4,6 +4,7 @@
  */
 
 const judgeStore = new Map();
+const wsManager = require('./wsManager');
 
 class StoreService {
   /**
@@ -36,10 +37,19 @@ class StoreService {
   update(judgeId, updates) {
     const existing = judgeStore.get(judgeId);
     if (existing) {
-      judgeStore.set(judgeId, {
+      const updated = {
         ...existing,
         ...updates,
         updatedAt: new Date().toISOString()
+      };
+      judgeStore.set(judgeId, updated);
+
+      // 通过 WebSocket 实时推送状态更新
+      wsManager.notify(judgeId, {
+        status: updated.status,
+        conclusion: updated.conclusion,
+        result: updated.result,
+        updatedAt: updated.updatedAt
       });
     }
   }
@@ -61,6 +71,27 @@ class StoreService {
       judgeId: id,
       ...data
     }));
+  }
+
+  /**
+   * List pending judge requests (for GitHub Actions to fetch)
+   * @param {number} limit - Maximum number of submissions to return
+   * @returns {Array} - Pending judge requests with full data
+   */
+  listPending(limit = 10) {
+    const pending = [];
+    for (const [id, data] of judgeStore.entries()) {
+      if (data.status === 'pending' || data.status === 'queued') {
+        pending.push({
+          judgeId: id,
+          ...data
+        });
+        if (pending.length >= limit) {
+          break;
+        }
+      }
+    }
+    return pending;
   }
 
   /**

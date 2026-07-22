@@ -2,6 +2,7 @@ const express = require('express');
 const router = express.Router();
 const githubService = require('../services/github');
 const store = require('../services/store');
+const requireApiKey = require('../middleware/apiKey');
 
 /**
  * GET /api/result/:judgeId
@@ -83,7 +84,7 @@ router.get('/result/:judgeId', async (req, res) => {
  * Receive judge result callback from GitHub Actions
  * This endpoint is called by the workflow when it completes
  */
-router.post('/callback', async (req, res) => {
+router.post('/callback', requireApiKey, async (req, res) => {
   try {
     const { judgeId, result } = req.body;
 
@@ -124,9 +125,9 @@ router.post('/callback', async (req, res) => {
 
 /**
  * GET /api/list
- * List all judge requests
+ * List all judge requests (requires API Key)
  */
-router.get('/list', (req, res) => {
+router.get('/list', requireApiKey, (req, res) => {
   const list = store.list();
   res.json({
     success: true,

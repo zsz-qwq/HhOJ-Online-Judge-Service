@@ -1,5 +1,8 @@
 const { Octokit } = require('@octokit/rest');
 const config = require('../config');
+const fs = require('fs');
+const path = require('path');
+const AdmZip = require('adm-zip');
 
 class GitHubService {
   constructor() {
@@ -8,17 +11,11 @@ class GitHubService {
     });
   }
 
-  /**
-   * Trigger the judge workflow
-   * @param {Object} payload - The judge payload
-   * @returns {Promise<string>} - The workflow run ID
-   */
   async triggerWorkflow(payload) {
     const { owner, repo, workflowId, ref } = config.github;
 
     try {
-      // Trigger workflow_dispatch
-      const response = await this.octokit.actions.createWorkflowDispatch({
+      await this.octokit.actions.createWorkflowDispatch({
         owner,
         repo,
         workflow_id: workflowId,
@@ -32,7 +29,6 @@ class GitHubService {
         }
       });
 
-      // Get the workflow run ID by listing recent runs
       const runs = await this.octokit.actions.listWorkflowRuns({
         owner,
         repo,
@@ -51,11 +47,6 @@ class GitHubService {
     }
   }
 
-  /**
-   * Get workflow run status
-   * @param {number} runId - The workflow run ID
-   * @returns {Promise<Object>} - The run status and result
-   */
   async getRunStatus(runId) {
     const { owner, repo } = config.github;
 
@@ -70,8 +61,8 @@ class GitHubService {
 
       return {
         id: run.id,
-        status: run.status,      // queued, in_progress, completed
-        conclusion: run.conclusion, // success, failure, cancelled, etc.
+        status: run.status,
+        conclusion: run.conclusion,
         html_url: run.html_url,
         created_at: run.created_at,
         updated_at: run.updated_at
@@ -82,16 +73,10 @@ class GitHubService {
     }
   }
 
-  /**
-   * Download artifact containing judge results
-   * @param {number} runId - The workflow run ID
-   * @returns {Promise<Object>} - The judge result
-   */
   async getResult(runId) {
     const { owner, repo } = config.github;
 
     try {
-      // List artifacts for the workflow run
       const artifacts = await this.octokit.actions.listWorkflowRunArtifacts({
         owner,
         repo,
@@ -106,7 +91,6 @@ class GitHubService {
         return null;
       }
 
-      // Download the artifact
       const download = await this.octokit.actions.downloadArtifact({
         owner,
         repo,
@@ -114,12 +98,41 @@ class GitHubService {
         archive_format: 'zip'
       });
 
-      // Parse the result from the artifact
-      // Note: In production, you'd need to unzip and parse the files
-      // For simplicity, we'll return the download URL
+      const tempDir = path.join(__dirname, '../temp');
+      if (!fs.existsSync(tempDir)) {
+        fs.mkdirSync(tempDir, { recursive: true });
+      }
+
+      const zipPath = path.join(tempDir, `artifact_${runId}.zip`);
+      const zipBuffer = Buffer.isBuffer(download.data) ? download.data : Buffer.from(download.data);
+      fs.writeFileSync(zipPath, zipBuffer);
+
+      let resultData = null;
+      try {
+        const zip = new AdmZip(zipPath);
+        const entries = zip.getEntries();
+
+        for (const entry of entries) {
+          if (entry.entryName === 'judge_result.json') {
+            const content = zip.readAsText(entry);
+            resultData = JSON.parse(content);
+            break;
+          }
+        }
+      } catch (parseError) {
+        console.error('Failed to parse artifact:', parseError);
+      }
+
+      try {
+        fs.unlinkSync(zipPath);
+      } catch {
+        // Ignore cleanup errors
+      }
+
       return {
         artifactId: resultArtifact.id,
-        downloadUrl: download.url
+        downloadUrl: download.url,
+        result: resultData
       };
     } catch (error) {
       console.error('Failed to get result:', error);
@@ -127,11 +140,6 @@ class GitHubService {
     }
   }
 
-  /**
-   * Get workflow run logs
-   * @param {number} runId - The workflow run ID
-   * @returns {Promise<string>} - The logs URL
-   */
   async getLogs(runId) {
     const { owner, repo } = config.github;
 
